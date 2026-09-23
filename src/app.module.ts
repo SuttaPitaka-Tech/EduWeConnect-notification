@@ -1,10 +1,11 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { APP_GUARD } from '@nestjs/core';
-import { KeycloakConnectModule, ResourceGuard, RoleGuard, AuthGuard } from 'nest-keycloak-connect';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
 import { MinioModule } from './minio/minio.module';
+import { ChatModule } from './chat/chat.module';
+import { Conversation, Participant, Message, Attachment } from './chat/entities';
 
 @Module({
   imports: [
@@ -12,29 +13,24 @@ import { MinioModule } from './minio/minio.module';
       isGlobal: true,
       envFilePath: 'environment/.env.local',
     }),
-    KeycloakConnectModule.register({
-      authServerUrl: process.env.KEYCLOAK_AUTH_SERVER_URL,
-      realm: process.env.KEYCLOAK_REALM,
-      clientId: process.env.KEYCLOAK_CLIENT_ID,
-      secret: process.env.KEYCLOAK_SECRET || '',
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => ({
+        type: 'mysql',
+        host: configService.get<string>('DB_HOST', '127.0.0.1'),
+        port: parseInt(configService.get<string>('DB_PORT', '3306'), 10),
+        username: configService.get<string>('DB_USER', 'root'),
+        password: configService.get<string>('DB_PASSWORD', 'Punith@1234'),
+        database: configService.get<string>('DB_NAME', 'eduweconn-notification-service'),
+        entities: [Conversation, Participant, Message, Attachment],
+        synchronize: true, // Auto-creates tables in MySQL
+      }),
     }),
     MinioModule,
+    ChatModule,
   ],
   controllers: [AppController],
-  providers: [
-    AppService,
-    {
-      provide: APP_GUARD,
-      useClass: AuthGuard,
-    },
-    {
-      provide: APP_GUARD,
-      useClass: ResourceGuard,
-    },
-    {
-      provide: APP_GUARD,
-      useClass: RoleGuard,
-    },
-  ],
+  providers: [AppService],
 })
 export class AppModule {}

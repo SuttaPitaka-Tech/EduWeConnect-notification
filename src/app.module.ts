@@ -10,6 +10,8 @@ import { Conversation, Participant, Message, Attachment } from './chat/entities'
 import { NotificationAlert } from './notifications/entities/notification-alert.entity';
 import { CallsModule } from './calls/calls.module';
 import { CallSession } from './calls/entities/call-session.entity';
+import { MeetingsModule } from './meetings/meetings.module';
+import { MeetingSchedule } from './meetings/entities/meeting-schedule.entity';
 
 @Module({
   imports: [
@@ -27,7 +29,15 @@ import { CallSession } from './calls/entities/call-session.entity';
         username: configService.get<string>('DB_USER'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_NAME'),
-        entities: [Conversation, Participant, Message, Attachment, NotificationAlert, CallSession],
+        entities: [
+          Conversation,
+          Participant,
+          Message,
+          Attachment,
+          NotificationAlert,
+          CallSession,
+          MeetingSchedule,
+        ],
         synchronize: true, // Auto-creates tables in MySQL
       }),
     }),
@@ -35,6 +45,7 @@ import { CallSession } from './calls/entities/call-session.entity';
     ChatModule,
     NotificationsModule,
     CallsModule,
+    MeetingsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

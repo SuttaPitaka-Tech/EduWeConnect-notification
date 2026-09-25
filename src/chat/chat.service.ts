@@ -7,11 +7,12 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In, DataSource } from 'typeorm';
+import { Repository, In, DataSource, MoreThan } from 'typeorm';
 import { Conversation, Participant, Message, Attachment } from './entities';
 import { CreateGroupDto, DirectChatDto, SendMessageDto } from './dto/chat.dto';
 import { MinioService } from '../minio/minio.service';
 import { canUsersChat, sortContactsByRoleHierarchy, normalizeRole } from './chat-permissions';
+import { NotificationsService } from '../notifications/notifications.service';
 
 export interface UserContext {
   id: string;
@@ -23,7 +24,7 @@ export interface UserContext {
 @Injectable()
 export class ChatService implements OnModuleInit {
   private readonly logger = new Logger(ChatService.name);
-  private readonly minioFolder = process.env.MINIO_CHAT_FOLDER || 'chats-objects';
+  private readonly minioFolder = process.env.MINIO_CHAT_FOLDER || 'chat-files';
 
   constructor(
     @InjectRepository(Conversation)
@@ -36,6 +37,7 @@ export class ChatService implements OnModuleInit {
     private readonly attachmentRepo: Repository<Attachment>,
     private readonly dataSource: DataSource,
     private readonly minioService: MinioService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   /**
@@ -49,11 +51,15 @@ export class ChatService implements OnModuleInit {
    * Retrieves all conversations for a user (Channels & Direct Messages)
    */
   async getUserConversations(userId: string, organizationId?: string | null): Promise<any[]> {
-    // 1. Fetch user's direct memberships
+    // 1. Fetch user's direct memberships that are not hidden
     const userMemberships = await this.participantRepo.find({
-      where: { user_id: userId },
+      where: { user_id: userId, is_hidden: false },
     });
     const userConvIds = userMemberships.map((m) => m.conversation_id);
+    const membershipMap = new Map<string, Participant>();
+    for (const m of userMemberships) {
+      membershipMap.set(m.conversation_id, m);
+    }
 
     // 2. Fetch public channels relevant to user's organization if provided
     let publicConvIds: string[] = [];
@@ -182,8 +188,15 @@ export class ChatService implements OnModuleInit {
     }
 
     const result = conversations.map((conv) => {
+      const myMembership = membershipMap.get(conv.id);
       const lastMessage = lastMessageMap.get(conv.id);
       const otherParticipants = conv.participants.filter((p) => p.user_id !== userId);
+
+      const isCleared =
+        myMembership?.cleared_at &&
+        lastMessage?.created_at &&
+        new Date(lastMessage.created_at).getTime() <= new Date(myMembership.cleared_at).getTime();
+      const effectiveLastMessage = isCleared ? null : lastMessage;
 
       let displayName = conv.name || 'Chat';
       let roleSubtitle = conv.topic || `${conv.participants.length} members`;
@@ -198,7 +211,7 @@ export class ChatService implements OnModuleInit {
       }
 
       const timestamp =
-        lastMessage?.created_at?.getTime() ||
+        effectiveLastMessage?.created_at?.getTime() ||
         conv.last_message_at?.getTime() ||
         conv.created_at?.getTime() ||
         0;
@@ -213,10 +226,10 @@ export class ChatService implements OnModuleInit {
         isPrivate: conv.is_private,
         role: conv.type === 'direct' ? roleSubtitle : undefined,
         subtitle: roleSubtitle,
-        unreadCount: unreadMap.get(conv.id) || 0,
-        lastMessage: lastMessage?.content || null,
-        lastMessageTime: lastMessage
-          ? lastMessage.created_at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        unreadCount: isCleared ? 0 : (unreadMap.get(conv.id) || 0),
+        lastMessage: effectiveLastMessage?.content || null,
+        lastMessageTime: effectiveLastMessage
+          ? effectiveLastMessage.created_at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           : null,
         lastMessageTimestamp: timestamp,
         participants: conv.participants.map((p) => ({
@@ -236,14 +249,26 @@ export class ChatService implements OnModuleInit {
   }
 
   /**
-   * Retrieves participant user IDs for a conversation
+   * Retrieves participant user IDs (and mapped organization IDs) for a conversation
    */
   async getParticipantUserIds(conversationId: string): Promise<string[]> {
     const parts = await this.participantRepo.find({
       where: { conversation_id: conversationId },
       select: ['user_id'],
     });
-    return parts.map((p) => p.user_id);
+    const ids = new Set<string>();
+    for (const p of parts) {
+      if (p.user_id) {
+        ids.add(p.user_id);
+        try {
+          const orgId = await this.resolveUserOrganization(p.user_id);
+          if (orgId) {
+            ids.add(orgId);
+          }
+        } catch {}
+      }
+    }
+    return Array.from(ids);
   }
 
   /**
@@ -262,8 +287,14 @@ export class ChatService implements OnModuleInit {
         : conversationOrId;
     if (!conv) return false;
 
-    // Direct chats and private conversations are accessible ONLY to participants
-    const isParticipant = conv.participants?.some((p) => p.user_id === user.id);
+    // Direct chats and private conversations are accessible to participants or mapped org admin
+    const userOrgId = user.organizationId || (await this.resolveUserOrganization(user.id));
+    const isParticipant = conv.participants?.some(
+      (p) =>
+        p.user_id === user.id ||
+        (userOrgId && p.user_id === userOrgId) ||
+        (user.organizationId && p.user_id === user.organizationId),
+    );
     if (isParticipant) return true;
 
     if (conv.type === 'direct' || conv.is_private) {
@@ -272,7 +303,7 @@ export class ChatService implements OnModuleInit {
 
     // Public channels are accessible to members of the same organization (or global if no org)
     if (conv.type === 'channel' && !conv.is_private) {
-      return !conv.organization_id || conv.organization_id === user.organizationId;
+      return !conv.organization_id || conv.organization_id === user.organizationId || conv.organization_id === userOrgId;
     }
 
     return false;
@@ -295,15 +326,25 @@ export class ChatService implements OnModuleInit {
       throw new NotFoundException(`Conversation with ID ${conversationId} not found`);
     }
 
+    let clearedAt: Date | null = null;
     if (userContext) {
       const allowed = await this.canUserAccessConversation(conv, userContext);
       if (!allowed) {
         throw new ForbiddenException('You do not have permission to view this conversation');
       }
+      const participant = conv.participants?.find((p) => p.user_id === userContext.id);
+      if (participant?.cleared_at) {
+        clearedAt = participant.cleared_at;
+      }
+    }
+
+    const whereCondition: any = { conversation_id: conversationId, is_deleted: false };
+    if (clearedAt) {
+      whereCondition.created_at = MoreThan(clearedAt);
     }
 
     const messages = await this.messageRepo.find({
-      where: { conversation_id: conversationId, is_deleted: false },
+      where: whereCondition,
       relations: ['attachments'],
       order: { created_at: 'ASC' },
       skip: (page - 1) * limit,
@@ -523,22 +564,8 @@ export class ChatService implements OnModuleInit {
       throw new BadRequestException('Cannot start a direct chat with yourself');
     }
 
-    // 1. Resolve organizations and validate permission
-    const senderOrgId = sender.organizationId || (await this.resolveUserOrganization(sender.id));
-    const recipientOrgId = await this.resolveUserOrganization(recipient.recipient_id);
-
-    const isPermitted = canUsersChat(
-      { id: sender.id, role: sender.role, organizationId: senderOrgId },
-      { id: recipient.recipient_id, userId: recipient.recipient_id, role: recipient.recipient_role, organizationId: recipientOrgId },
-    );
-
-    if (!isPermitted) {
-      throw new ForbiddenException(
-        'Cross-organization direct messaging is not permitted for your role',
-      );
-    }
-
-    // Find shared direct conversation
+    // 1. Check if direct conversation already exists between sender and recipient
+    // (e.g. unhide a previously hidden conversation)
     const senderMemberships = await this.participantRepo.find({
       where: { user_id: sender.id },
     });
@@ -553,7 +580,12 @@ export class ChatService implements OnModuleInit {
         relations: ['conversation'],
       });
 
-      if (sharedMembership && sharedMembership.conversation.type === 'direct') {
+      if (sharedMembership && sharedMembership.conversation?.type === 'direct') {
+        // Unhide for sender if it was hidden
+        await this.participantRepo.update(
+          { conversation_id: sharedMembership.conversation.id, user_id: sender.id },
+          { is_hidden: false },
+        );
         return {
           id: sharedMembership.conversation.id,
           type: 'direct',
@@ -563,12 +595,27 @@ export class ChatService implements OnModuleInit {
       }
     }
 
-    // Create new direct conversation
+    // 2. Resolve organizations and validate permission for new direct chat
+    const senderOrgId = sender.organizationId || (await this.resolveUserOrganization(sender.id));
+    const recipientOrgId = await this.resolveUserOrganization(recipient.recipient_id);
+
+    const isPermitted = canUsersChat(
+      { id: sender.id, role: sender.role, organizationId: senderOrgId },
+      { id: recipient.recipient_id, userId: recipient.recipient_id, role: recipient.recipient_role, organizationId: recipientOrgId },
+    );
+
+    if (!isPermitted) {
+      throw new ForbiddenException(
+        'Cross-organization direct messaging is not permitted for your role',
+      );
+    }
+
+    // 3. Create new direct conversation
     const conv = this.conversationRepo.create({
       type: 'direct',
       is_private: true,
       created_by: sender.id,
-      organization_id: sender.organizationId || null,
+      organization_id: senderOrgId || null,
       last_message_at: new Date(),
     });
     const savedConv = await this.conversationRepo.save(conv);
@@ -618,13 +665,25 @@ export class ChatService implements OnModuleInit {
     }
 
     const now = new Date();
+
+    let normalizedType: 'text' | 'file' | 'system' = 'text';
+    if (
+      dto.message_type === 'file' ||
+      (dto.message_type as string) === 'image' ||
+      (dto.attachments && dto.attachments.length > 0)
+    ) {
+      normalizedType = 'file';
+    } else if (dto.message_type === 'system') {
+      normalizedType = 'system';
+    }
+
     const message = this.messageRepo.create({
       conversation_id: dto.conversation_id,
       sender_id: sender.id,
       sender_name: sender.name,
       sender_role: sender.role,
       content: dto.content?.trim() || '',
-      message_type: dto.message_type || (dto.attachments?.length ? 'file' : 'text'),
+      message_type: normalizedType,
       reply_to_id: dto.reply_to_id || null,
       status: initialStatus,
       delivered_at: initialStatus !== 'sent' ? now : null,
@@ -642,7 +701,7 @@ export class ChatService implements OnModuleInit {
           file_name: att.file_name,
           file_type: att.file_type,
           file_size: att.file_size,
-          storage_key: att.storage_key,
+          storage_key: att.storage_key || '',
           url: att.url || null,
         }),
       );
@@ -653,6 +712,40 @@ export class ChatService implements OnModuleInit {
     await this.conversationRepo.update(conversation.id, {
       last_message_at: now,
     });
+
+    // Unhide conversation for participants if it was hidden
+    await this.participantRepo.update(
+      { conversation_id: conversation.id, is_hidden: true },
+      { is_hidden: false },
+    );
+
+    // Create privacy-safe notification alert for other participants
+    try {
+      const participants = await this.participantRepo.find({
+        where: { conversation_id: conversation.id },
+      });
+      for (const p of participants) {
+        if (p.user_id !== sender.id) {
+          // Check role permissions: who can chat with who
+          const permitted = canUsersChat(
+            { id: sender.id, role: sender.role, organizationId: sender.organizationId },
+            { userId: p.user_id, role: p.user_role, organizationId: sender.organizationId },
+          );
+          if (permitted) {
+            await this.notificationsService.createChatAlert({
+              recipientId: p.user_id,
+              senderId: sender.id,
+              senderName: sender.name,
+              senderRole: sender.role,
+              organizationName: sender.organizationId || null,
+              conversationId: conversation.id,
+            });
+          }
+        }
+      }
+    } catch (notifErr: any) {
+      this.logger.warn(`Failed to create notification alert: ${notifErr.message}`);
+    }
 
     let replyTo: { id: string; senderName: string; content: string } | null = null;
     if (savedMessage.reply_to_id) {
@@ -696,7 +789,8 @@ export class ChatService implements OnModuleInit {
   }
 
   /**
-   * Uploads raw media/files/images directly to MinIO under chats-objects/ folder
+   * Uploads raw media/files/images directly to MinIO under chat-files/ folder
+   * Strictly enforces 2MB maximum file size limit
    */
   async uploadAttachmentToMinio(
     file: Express.Multer.File,
@@ -708,8 +802,13 @@ export class ChatService implements OnModuleInit {
     storage_key: string;
     url: string;
   }> {
+    const MAX_SIZE = 2 * 1024 * 1024; // 2MB limit
+    if (file.size > MAX_SIZE) {
+      throw new BadRequestException('File size exceeds the maximum limit of 2MB');
+    }
+
     const cleanFileName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const storageKey = `${this.minioFolder}/${conversationId}/${Date.now()}_${cleanFileName}`;
+    const storageKey = `chat-files/${conversationId}/${Date.now()}_${cleanFileName}`;
 
     await this.minioService.uploadFile(file.buffer, storageKey, file.mimetype);
     const signedUrl = await this.minioService.getFileUrl(storageKey);
@@ -780,13 +879,26 @@ export class ChatService implements OnModuleInit {
 
     const conversationId = msg.conversation_id;
 
-    // 1. Delete associated attachments if any
+    // 1. Fetch associated attachments to permanently delete them from MinIO
+    const attachments = await this.attachmentRepo.find({ where: { message_id: messageId } });
+    for (const att of attachments) {
+      if (att.storage_key) {
+        try {
+          await this.minioService.deleteFile(att.storage_key);
+          this.logger.log(`Deleted attachment from MinIO: ${att.storage_key}`);
+        } catch (minioErr: any) {
+          this.logger.warn(`Failed to delete MinIO attachment ${att.storage_key}: ${minioErr.message}`);
+        }
+      }
+    }
+
+    // 2. Delete associated attachments from database
     await this.attachmentRepo.delete({ message_id: messageId });
 
-    // 2. Clear any replies pointing to this message
+    // 3. Clear any replies pointing to this message
     await this.messageRepo.update({ reply_to_id: messageId }, { reply_to_id: null });
 
-    // 3. Delete the message record permanently from the database table
+    // 4. Delete the message record permanently from the database table
     await this.messageRepo.delete(messageId);
 
     return {
@@ -818,32 +930,42 @@ export class ChatService implements OnModuleInit {
    * (Admins, Organization, Staff/Teachers, Students)
    */
   /**
-   * Resolves a user's associated organizationId by checking student_details, staff_details, and organization-details
+   * Resolves a user's associated organizationId by checking staff_details, student_details, and organization-details
    */
   async resolveUserOrganization(userId: string): Promise<string | null> {
+    if (!userId) return null;
     try {
-      // 1. Check student_details
-      const studentRows = await this.dataSource.query(
-        'SELECT organization_id FROM `role-allocation-service`.student_details WHERE id = ? OR contact_email = ? LIMIT 1',
-        [userId, userId],
-      );
-      if (studentRows.length > 0 && studentRows[0].organization_id) {
-        return studentRows[0].organization_id;
-      }
-
-      // 2. Check staff_details
+      // 1. Check staff_details (matching sd.id, sd.employee_email, or joined ur.user_id / ur.email_id)
       const staffRows = await this.dataSource.query(
-        'SELECT organization_id FROM `role-allocation-service`.staff_details WHERE id = ? OR employee_email = ? LIMIT 1',
-        [userId, userId],
+        `SELECT sd.organization_id FROM \`role-allocation-service\`.staff_details sd
+         LEFT JOIN \`role-allocation-service\`.user_roles ur ON (ur.email_id = sd.employee_email OR ur.user_id = sd.id)
+         WHERE sd.id = ? OR sd.employee_email = ? OR ur.user_id = ? OR ur.email_id = ?
+         LIMIT 1`,
+        [userId, userId, userId, userId],
       );
       if (staffRows.length > 0 && staffRows[0].organization_id) {
         return staffRows[0].organization_id;
       }
 
-      // 3. Check organization-details
+      // 2. Check student_details (matching st.id, st.contact_email, or joined ur.user_id / ur.email_id)
+      const studentRows = await this.dataSource.query(
+        `SELECT st.organization_id FROM \`role-allocation-service\`.student_details st
+         LEFT JOIN \`role-allocation-service\`.user_roles ur ON (ur.user_id = st.id OR ur.email_id = st.contact_email)
+         WHERE st.id = ? OR st.contact_email = ? OR ur.user_id = ? OR ur.email_id = ?
+         LIMIT 1`,
+        [userId, userId, userId, userId],
+      );
+      if (studentRows.length > 0 && studentRows[0].organization_id) {
+        return studentRows[0].organization_id;
+      }
+
+      // 3. Check organization-details (matching od.id, od.organization_email, or joined ur.user_id / ur.email_id)
       const orgRows = await this.dataSource.query(
-        'SELECT id FROM `role-allocation-service`.`organization-details` WHERE id = ? OR organization_email = ? LIMIT 1',
-        [userId, userId],
+        `SELECT od.id FROM \`role-allocation-service\`.\`organization-details\` od
+         LEFT JOIN \`role-allocation-service\`.user_roles ur ON (od.organization_email = ur.email_id OR od.id = ur.user_id)
+         WHERE od.id = ? OR od.organization_email = ? OR ur.user_id = ? OR ur.email_id = ?
+         LIMIT 1`,
+        [userId, userId, userId, userId],
       );
       if (orgRows.length > 0 && orgRows[0].id) {
         return orgRows[0].id;
@@ -853,8 +975,8 @@ export class ChatService implements OnModuleInit {
       const userRoles = await this.dataSource.query(
         `SELECT od.id AS org_id FROM \`role-allocation-service\`.user_roles ur
          INNER JOIN \`role-allocation-service\`.\`organization-details\` od ON (od.organization_email = ur.email_id OR od.id = ur.user_id)
-         WHERE ur.user_id = ? LIMIT 1`,
-        [userId],
+         WHERE ur.user_id = ? OR ur.email_id = ? LIMIT 1`,
+        [userId, userId],
       );
       if (userRoles.length > 0 && userRoles[0].org_id) {
         return userRoles[0].org_id;
@@ -1090,6 +1212,9 @@ export class ChatService implements OnModuleInit {
           .execute();
       }
 
+      // Automatically delete alert for this conversation from notification_alert to free up space
+      await this.notificationsService.deleteByConversation(conversationId, readerId);
+
       return { affected: result.affected || 0 };
     } catch (err: any) {
       this.logger.error(`Failed to mark conversation as read: ${err.message}`);
@@ -1126,4 +1251,50 @@ export class ChatService implements OnModuleInit {
       return [];
     }
   }
+
+  /**
+   * Clears conversation history for the requesting user (does NOT affect the other user)
+   */
+  async clearChatHistory(conversationId: string, user: UserContext): Promise<any> {
+    const participant = await this.participantRepo.findOne({
+      where: { conversation_id: conversationId, user_id: user.id },
+    });
+    if (!participant) {
+      throw new NotFoundException('Participant record not found for this conversation');
+    }
+
+    const now = new Date();
+    participant.cleared_at = now;
+    participant.is_hidden = true;
+    await this.participantRepo.save(participant);
+
+    return {
+      status: 'success',
+      message: 'Chat history cleared for user',
+      conversationId,
+      clearedAt: now,
+    };
+  }
+
+  /**
+   * Hides the conversation from the user's sidebar
+   */
+  async hideChat(conversationId: string, user: UserContext): Promise<any> {
+    const participant = await this.participantRepo.findOne({
+      where: { conversation_id: conversationId, user_id: user.id },
+    });
+    if (!participant) {
+      throw new NotFoundException('Participant record not found for this conversation');
+    }
+
+    participant.is_hidden = true;
+    await this.participantRepo.save(participant);
+
+    return {
+      status: 'success',
+      message: 'Chat hidden for user',
+      conversationId,
+    };
+  }
 }
+

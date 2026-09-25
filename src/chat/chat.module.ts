@@ -9,12 +9,14 @@ import { ChatController } from './chat.controller';
 import { WsJwtGuard } from './guards/ws-jwt.guard';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { MinioModule } from '../minio/minio.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Conversation, Participant, Message, Attachment]),
     ConfigModule,
     MinioModule,
+    NotificationsModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

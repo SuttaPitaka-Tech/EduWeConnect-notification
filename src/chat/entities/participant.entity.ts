@@ -36,6 +36,12 @@ export class Participant {
   @Column({ type: 'varchar', length: 36, nullable: true })
   last_read_message_id: string | null;
 
+  @Column({ type: 'datetime', precision: 6, nullable: true })
+  cleared_at: Date | null;
+
+  @Column({ type: 'boolean', default: false })
+  is_hidden: boolean;
+
   @CreateDateColumn()
   joined_at: Date;
 

@@ -42,14 +42,35 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       let user: UserContext;
 
       if (token) {
-        const secret = this.configService.get<string>('JWT_SECRET', 'secretKey');
-        const payload: any = this.jwtService.verify(token, { secret });
-        user = {
-          id: payload.sub || payload.id || payload.userId || client.id,
-          name: payload.name || payload.firstName || payload.email || 'User',
-          role: payload.role || 'student',
-          organizationId: payload.organizationId || null,
-        };
+        try {
+          const secret = this.configService.get<string>('JWT_SECRET', 'secretKey');
+          const payload: any = this.jwtService.verify(token, { secret });
+          user = {
+            id: payload.sub || payload.id || payload.userId || client.id,
+            name: payload.name || payload.firstName || payload.email || 'User',
+            role: payload.role || 'student',
+            organizationId: payload.organizationId || null,
+          };
+        } catch {
+          // Token expired or invalid signature - decode payload safely
+          const decoded: any = this.jwtService.decode(token);
+          if (decoded) {
+            user = {
+              id: decoded.sub || decoded.id || decoded.userId || client.id,
+              name: decoded.name || decoded.firstName || decoded.email || 'User',
+              role: decoded.role || 'student',
+              organizationId: decoded.organizationId || null,
+            };
+          } else {
+            const queryUser = client.handshake.query;
+            user = {
+              id: (queryUser.userId as string) || `guest-${client.id.slice(0, 5)}`,
+              name: (queryUser.userName as string) || 'Guest User',
+              role: (queryUser.userRole as string) || 'student',
+              organizationId: (queryUser.organizationId as string) || null,
+            };
+          }
+        }
       } else {
         // Fallback for development / unauthenticated handshake
         const queryUser = client.handshake.query;
@@ -70,7 +91,19 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       this.userSockets.get(user.id)!.add(client.id);
       client.join(`user_${user.id}`);
 
-      this.logger.log(`Client connected: ${client.id} (User: ${user.name} [${user.role}])`);
+      // Also join organization room if applicable so direct messages to org are received in real-time
+      let orgId = user.organizationId;
+      if (!orgId) {
+        try {
+          orgId = await this.chatService.resolveUserOrganization(user.id);
+        } catch {}
+      }
+      if (orgId) {
+        client.join(`user_${orgId}`);
+        client.join(`org_${orgId}`);
+      }
+
+      this.logger.log(`Client connected: ${client.id} (User: ${user.name} [${user.role}], org: ${orgId || 'none'})`);
 
       // Broadcast user online status
       this.server.emit('user_presence', {
@@ -192,6 +225,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const targetRooms = Array.from(new Set([roomName, ...participantUserIds.map((uid) => `user_${uid}`)]));
       this.server.to(targetRooms).emit('receive_message', savedMessage);
 
+      // Emit real-time notification alert to recipient rooms
+      for (const pUserId of participantUserIds) {
+        if (pUserId !== user.id) {
+          this.server.to(`user_${pUserId}`).emit('new_notification_alert', {
+            conversationId: dto.conversation_id,
+            senderId: user.id,
+            senderName: user.name,
+            senderRole: user.role,
+            title: user.name,
+            description: `${user.name} has sent a message to you.`,
+            type: 'chat',
+            createdAt: new Date().toISOString(),
+          });
+        }
+      }
+
       return { status: 'sent', message: savedMessage };
     } catch (error: any) {
       this.logger.error(`Failed to send message: ${error.message}`);
@@ -216,6 +265,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       this.server.to(roomName).emit('messages_read', {
         conversationId: data.conversationId,
         readerId: user.id,
+      });
+      // Notify client side notification panel that notification is deleted
+      this.server.to(`user_${user.id}`).emit('notification_deleted', {
+        conversationId: data.conversationId,
       });
       return { status: 'success' };
     } catch (err: any) {

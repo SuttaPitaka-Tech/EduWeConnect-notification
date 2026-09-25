@@ -143,12 +143,12 @@ export class ChatController {
   }
 
   /**
-   * Upload image/document/file to MinIO under chats-objects/
+   * Upload image/document/file to MinIO under chat-files/
    */
   @Post('upload')
   @UseInterceptors(
     FileInterceptor('file', {
-      limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB max
+      limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB max limit
     }),
   )
   async uploadAttachment(
@@ -157,6 +157,9 @@ export class ChatController {
   ) {
     if (!file) {
       throw new BadRequestException('No file provided for upload');
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      throw new BadRequestException('File size exceeds the maximum limit of 2MB');
     }
     const convId = conversationId || 'general';
     return this.chatService.uploadAttachmentToMinio(file, convId);
@@ -193,5 +196,23 @@ export class ChatController {
   @Post('messages/:id/pin')
   async togglePin(@Param('id') messageId: string) {
     return this.chatService.togglePinMessage(messageId);
+  }
+
+  /**
+   * Clear chat history for current user only
+   */
+  @Post('conversations/:id/clear')
+  async clearChatHistory(@Param('id') conversationId: string, @Req() req: Request) {
+    const user = this.getUserContext(req);
+    return this.chatService.clearChatHistory(conversationId, user);
+  }
+
+  /**
+   * Hide conversation for current user
+   */
+  @Post('conversations/:id/hide')
+  async hideChat(@Param('id') conversationId: string, @Req() req: Request) {
+    const user = this.getUserContext(req);
+    return this.chatService.hideChat(conversationId, user);
   }
 }

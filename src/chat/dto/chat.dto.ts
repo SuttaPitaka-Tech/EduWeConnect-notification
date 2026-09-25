@@ -16,13 +16,13 @@ export class DirectChatDto {
 export class SendMessageDto {
   conversation_id: string;
   content: string;
-  message_type?: 'text' | 'file' | 'system';
+  message_type?: 'text' | 'file' | 'system' | string;
   reply_to_id?: string;
   attachments?: {
     file_name: string;
     file_type: string;
     file_size: string;
-    storage_key: string;
+    storage_key?: string;
     url?: string;
   }[];
 }

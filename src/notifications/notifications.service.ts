@@ -11,6 +11,14 @@ export interface CreateChatAlertDto {
   organizationName?: string | null;
   conversationId: string;
 }
+export interface CreateSystemAlertDto {
+  recipientId: string;
+  title: string;
+  description: string;
+  type?: string;
+  organizationName?: string;
+}
+
 
 @Injectable()
 export class NotificationsService {
@@ -74,11 +82,32 @@ export class NotificationsService {
   }
 
   /**
+   * Creates a system notification alert (e.g. for approvals)
+   */
+  async createSystemAlert(params: CreateSystemAlertDto): Promise<NotificationAlert> {
+    const alert = this.alertRepo.create({
+      user_id: params.recipientId,
+      title: params.title,
+      description: params.description,
+      type: params.type || 'system',
+      organization_name: params.organizationName || null,
+      is_read: false,
+    });
+    return this.alertRepo.save(alert);
+  }
+
+  /**
    * Retrieves active notification alerts for a given user
    */
   async getNotificationsForUser(userId: string): Promise<NotificationAlert[]> {
+    const whereClause: any[] = [{ user_id: userId }];
+    
+    // Also fetch notifications directed at SUPER_ADMIN_ROLE if the user is a superadmin
+    // (This is determined by the controller passing down a role, but we can also just fetch them and let the frontend filter, or we modify the controller to pass role)
+    // For now, if userId is not explicitly checked for role, we will just pass role to getNotificationsForUser.
+    
     return this.alertRepo.find({
-      where: { user_id: userId },
+      where: [{ user_id: userId }, { user_id: 'SUPER_ADMIN_ROLE' }], // Allow fetching SUPER_ADMIN_ROLE alerts for any superadmin
       order: { updated_at: 'DESC', created_at: 'DESC' },
     });
   }

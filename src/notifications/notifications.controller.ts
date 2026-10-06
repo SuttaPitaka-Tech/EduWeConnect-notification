@@ -133,10 +133,18 @@ export class NotificationsController {
         timestamp: this.formatNotificationTime(displayDate),
         createdAt: displayDate.toISOString(),
         isRead: a.is_read,
-        type: 'chat',
+        type: a.type || 'system',
         tag: formattedRole,
       };
     });
+  }
+
+  /**
+   * Create a system notification alert
+   */
+  @Post('system')
+  async createSystemAlert(@Req() req: Request) {
+    return this.notificationsService.createSystemAlert(req.body);
   }
 
   /**
